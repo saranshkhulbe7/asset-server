@@ -1,0 +1,5 @@
+[watch]
+  include = ["src"]
+
+[logging]
+  level = "info"

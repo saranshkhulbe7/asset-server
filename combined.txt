@@ -1,0 +1,1370 @@
+
+src/config/processingConfig.ts
+------------------------------
+export type AssetType = "image" | "video" | "pdf";
+
+export interface ImageProcessingOptions {
+  // Optional cropping parameters (in pixels)
+  cropParams?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  // Whether to compress the image (if above a minimum size)
+  compress?: boolean;
+  // Optional resize dimensions
+  resize?: {
+    width?: number;
+    height?: number;
+  };
+}
+
+export interface VideoProcessingOptions {
+  // Optional trimming parameters (in seconds)
+  trimParams?: {
+    start: number;
+    end: number;
+  };
+  // Optional cropping parameters (in pixels)
+  cropParams?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  // Whether to compress the video (if above a minimum size)
+  compression?: boolean;
+}
+export interface PDFProcessingOptions {
+  // Whether to compress the PDF
+  compress?: boolean;
+}
+
+export type ProcessingOptions =
+  | ImageProcessingOptions
+  | VideoProcessingOptions
+  | PDFProcessingOptions;
+
+export interface ProcessingConfig {
+  type: AssetType;
+  options?: ProcessingOptions;
+}
+
+
+src/config/db.ts
+----------------
+import * as mongoose from "mongoose";
+
+const connectDB = async () => {
+  console.log("connection uri", process.env.MONGO_URI);
+  try {
+    if (process.env.MONGO_URI !== undefined) {
+      const conn = await mongoose.connect(process.env.MONGO_URI, {
+        autoIndex: true,
+      });
+      console.log(`MongoDB Connected: ${conn.connection.host}`);
+
+      // Graceful shutdown
+      process.on("SIGINT", async () => {
+        await mongoose.disconnect();
+        console.log("MongoDB connection closed", process.env.MONGO_URI);
+        process.exit(0);
+      });
+    }
+  } catch (err: any) {
+    console.error(`Error mongodb: ${err.message}`);
+    process.exit(1);
+  }
+};
+
+export default connectDB;
+
+
+src/config/queue.ts
+-------------------
+import amqplib, { type Connection, type Channel } from "amqplib";
+
+const RABBIT_URL = "amqp://localhost";
+export const PROCESSING_QUEUE = "asset_processing_queue";
+
+let connection: Connection | null = null;
+let channel: Channel | null = null;
+
+export async function connectRabbitMQ(): Promise<Channel> {
+  if (channel) return channel;
+  connection = await amqplib.connect(RABBIT_URL);
+  channel = await connection.createChannel();
+  await channel.assertQueue(PROCESSING_QUEUE, { durable: true });
+  console.log("Asset Server: connected to RabbitMQ at", RABBIT_URL);
+  return channel;
+}
+
+
+src/utils/public-asset-exists.ts
+--------------------------------
+export async function publicAssetExists(url: string): Promise<boolean> {
+  try {
+    const resp = await fetch(url, { method: "HEAD" });
+    // A successful HEAD is typically 200, 301, or 302.
+    // If your bucket enforces redirect for CDNs, handle that as well.
+    return resp.ok;
+  } catch (error) {
+    // Network errors or other issues => treat as "does not exist"
+    return false;
+  }
+}
+
+
+src/utils/videoProcessor.ts
+---------------------------
+import ffmpeg from "fluent-ffmpeg";
+import path from "path";
+import { promises as fs } from "fs";
+import type { LogEventCurriedProps } from "./logService";
+
+interface CropParams {
+  x: number; // in pixels
+  y: number; // in pixels
+  width: number; // in pixels
+  height: number; // in pixels
+}
+
+interface TrimParams {
+  start: number; // start time in seconds
+  end: number; // end time in seconds
+}
+
+function getVideoDimensions(
+  inputPath: string
+): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(inputPath, (err, metadata) => {
+      if (err) return reject(err);
+      const videoStream = metadata.streams.find(
+        (stream) => stream.codec_type === "video"
+      );
+      if (!videoStream || !videoStream.width || !videoStream.height) {
+        return reject(new Error("Could not determine video dimensions"));
+      }
+      resolve({ width: videoStream.width, height: videoStream.height });
+    });
+  });
+}
+
+function getVideoDuration(inputPath: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(inputPath, (err, metadata) => {
+      if (err) return reject(err);
+      const duration = metadata.format?.duration;
+      if (typeof duration !== "number") {
+        return reject(new Error("Could not determine video duration"));
+      }
+      resolve(duration);
+    });
+  });
+}
+
+export async function processVideo({
+  inputPath,
+  cropParams,
+  trimParams,
+  compression,
+  options,
+}: {
+  inputPath: string;
+  cropParams?: CropParams | null;
+  trimParams?: TrimParams | null;
+  compression: boolean;
+  options?: {
+    logEventFn?: (props: LogEventCurriedProps) => Promise<void>;
+  };
+}): Promise<string> {
+  // Define minimum file size (in bytes) for compression (e.g., 1.5 MB)
+  const MIN_SIZE = 1.5 * 1024 * 1024;
+
+  // Hard-coded output folder for videos.
+  const outputFolder = path.join(process.cwd(), "processed");
+  await fs.mkdir(outputFolder, { recursive: true });
+  const baseName = path.basename(inputPath, path.extname(inputPath));
+  const outputPath = path.join(outputFolder, `compressed-${baseName}.mp4`);
+
+  // Validate cropping parameters against video dimensions if provided.
+  let validCrop = false;
+  if (cropParams) {
+    try {
+      const { width: vidWidth, height: vidHeight } = await getVideoDimensions(
+        inputPath
+      );
+      if (
+        cropParams.x < 0 ||
+        cropParams.y < 0 ||
+        cropParams.x + cropParams.width > vidWidth ||
+        cropParams.y + cropParams.height > vidHeight
+      ) {
+        console.error(
+          `Crop parameters (${cropParams.x}, ${cropParams.y}, ${cropParams.width}, ${cropParams.height}) exceed video dimensions (${vidWidth} x ${vidHeight}). Proceeding without cropping (using full video).`
+        );
+        if (options?.logEventFn) {
+          await options.logEventFn({
+            status: "warning",
+            message: `Crop parameters (${cropParams.x}, ${cropParams.y}, ${cropParams.width}, ${cropParams.height}) exceed video dimensions (${vidWidth} x ${vidHeight}). Proceeding without cropping (using full video).`,
+          });
+        }
+      } else {
+        validCrop = true;
+      }
+    } catch (error) {
+      console.error(
+        "Error retrieving video dimensions:",
+        (error as Error).message
+      );
+      if (options?.logEventFn) {
+        await options.logEventFn({
+          status: "warning",
+          message:
+            "Error retrieving video dimensions: " + (error as Error).message,
+          error: (error as Error).stack,
+        });
+      }
+      // In case of error, skip cropping.
+    }
+  }
+
+  // Validate trimming parameters if provided.
+  let validTrim = false;
+  if (trimParams) {
+    try {
+      const videoDuration = await getVideoDuration(inputPath);
+      if (
+        trimParams.start < 0 ||
+        trimParams.end > videoDuration ||
+        trimParams.start >= trimParams.end
+      ) {
+        console.error(
+          `Trim parameters (start: ${trimParams.start}, end: ${trimParams.end}) are invalid. Video duration is ${videoDuration} seconds. Proceeding without trimming.`
+        );
+        if (options?.logEventFn) {
+          await options.logEventFn({
+            status: "warning",
+            message: `Trim parameters (start: ${trimParams.start}, end: ${trimParams.end}) are invalid. Video duration is ${videoDuration} seconds. Proceeding without trimming.`,
+          });
+        }
+      } else {
+        validTrim = true;
+      }
+    } catch (error) {
+      console.error(
+        "Error retrieving video duration:",
+        (error as Error).message
+      );
+      if (options?.logEventFn) {
+        await options.logEventFn({
+          status: "warning",
+          message:
+            "Error retrieving video duration: " + (error as Error).message,
+          error: (error as Error).stack,
+        });
+      }
+      // In case of error, skip trimming.
+    }
+  }
+
+  return new Promise(async (resolve, reject) => {
+    let ffmpegCommand = ffmpeg(inputPath).videoCodec("libx264");
+
+    // Apply trimming if valid trimming parameters are provided.
+    if (trimParams && validTrim) {
+      const { start, end } = trimParams;
+      const duration = end - start;
+      ffmpegCommand = ffmpegCommand.setStartTime(start).setDuration(duration);
+    } else {
+      if (trimParams) {
+        console.error("Trimming skipped due to invalid trim parameters.");
+        if (options?.logEventFn) {
+          await options.logEventFn({
+            status: "warning",
+            message: "Trimming skipped due to invalid trim parameters.",
+          });
+        }
+      }
+    }
+
+    // Apply cropping if valid cropping parameters are provided.
+    if (cropParams && validCrop) {
+      const { x, y, width, height } = cropParams;
+      ffmpegCommand = ffmpegCommand.videoFilters(
+        `crop=${width}:${height}:${x}:${y}`
+      );
+    } else {
+      if (cropParams) {
+        console.error("Cropping skipped due to invalid crop parameters.");
+        if (options?.logEventFn) {
+          await options.logEventFn({
+            status: "warning",
+            message: "Cropping skipped due to invalid crop parameters.",
+          });
+        }
+      }
+    }
+
+    // Scale the video to 640 pixels wide (maintaining aspect ratio).
+    ffmpegCommand = ffmpegCommand.size("640x?");
+
+    // Check file size and conditionally apply compression.
+    try {
+      const stats = await fs.stat(inputPath);
+      if (compression && stats.size > MIN_SIZE) {
+        ffmpegCommand = ffmpegCommand.outputOptions("-crf 32");
+      } else {
+        console.log("Skipping compression due to file size threshold.");
+        if (options?.logEventFn) {
+          await options.logEventFn({
+            status: "processing",
+            message: "Skipping compression due to file size threshold.",
+          });
+        }
+      }
+    } catch (error) {
+      console.error(
+        "Error retrieving file size, proceeding without compression",
+        error
+      );
+      if (options?.logEventFn) {
+        await options.logEventFn({
+          status: "warning",
+          message: "Error retrieving file size, proceeding without compression",
+          error: (error as Error).stack,
+        });
+      }
+    }
+
+    ffmpegCommand
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => reject(err))
+      .save(outputPath);
+  });
+}
+
+
+src/utils/pdfProcessor.ts
+-------------------------
+import fs from "fs";
+import path from "path";
+import os from "os";
+import { exec } from "child_process";
+import { promisify } from "util";
+import type { LogEventCurriedProps } from "./logService";
+
+const execAsync = promisify(exec);
+
+export async function processPDF({
+  inputPath,
+  compress,
+  options,
+}: {
+  inputPath: string;
+  compress: boolean;
+  options?: {
+    logEventFn?: (props: LogEventCurriedProps) => Promise<void>;
+  };
+}): Promise<Buffer> {
+  const fileBuffer = await fs.promises.readFile(inputPath);
+  const MIN_SIZE = 50 * 1024; // 500KB threshold
+
+  if (compress && fileBuffer.length > MIN_SIZE) {
+    console.log("Compressing PDF using Ghostscript...");
+    if (options?.logEventFn) {
+      await options?.logEventFn({
+        status: "processing",
+        message: "Compressing PDF using Ghostscript...",
+      });
+    }
+    const outputFileName = `compressed-${path.basename(inputPath)}`;
+    const outputPath = path.join(os.tmpdir(), outputFileName);
+    const command = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${outputPath}" "${inputPath}"`;
+    try {
+      const { stderr } = await execAsync(command);
+      if (stderr) {
+        console.error("Ghostscript reported:", stderr);
+        if (options?.logEventFn) {
+          await options?.logEventFn({
+            status: "warning",
+            message: "Ghostscript reported: " + stderr,
+          });
+        }
+      }
+      const compressedBuffer = await fs.promises.readFile(outputPath);
+      await fs.promises.unlink(outputPath);
+      return compressedBuffer;
+    } catch (error) {
+      console.error("Error during PDF compression:", (error as Error).message);
+      if (options?.logEventFn) {
+        await options?.logEventFn({
+          status: "warning",
+          message: "Error during PDF compression: " + (error as Error).message,
+          error: (error as Error).stack,
+        });
+      }
+      return fileBuffer;
+    }
+  } else {
+    console.log("Skipping PDF compression.");
+    if (options?.logEventFn) {
+      await options?.logEventFn({
+        status: "warning",
+        message: "Skipping PDF compression.",
+      });
+    }
+    return fileBuffer;
+  }
+}
+
+
+src/utils/getAssetType.ts
+-------------------------
+export async function getAssetType(
+  url: string
+): Promise<"image" | "video" | "pdf" | "unknown"> {
+  try {
+    const response = await fetch(url, { method: "HEAD" });
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.startsWith("image/")) {
+      return "image";
+    }
+    if (contentType.startsWith("video/")) {
+      return "video";
+    }
+    if (contentType === "application/pdf") {
+      return "pdf";
+    }
+    return "unknown";
+  } catch (error) {
+    console.error("Error fetching asset type:", (error as Error).message);
+    return "unknown";
+  }
+}
+
+
+src/utils/logService.ts
+-----------------------
+import { Log } from "../models/Log";
+import { logger } from "./logger";
+import chalk from "chalk";
+
+export type LogStatus =
+  | "pending"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "error"
+  | "warning";
+
+export interface LogEventCurriedProps {
+  status: LogStatus;
+  message: string;
+  error?: string; // new field to optionally include error info (e.g. error stack)
+}
+
+export async function createLogger({
+  requestId,
+  source,
+  originalUrl,
+  processingConfig,
+}: {
+  requestId: string;
+  source: string;
+  originalUrl: string;
+  processingConfig?: Record<string, any>;
+}) {
+  // Look for an existing log document for the asset.
+  let logDoc = await Log.findOne({ originalUrl });
+  if (!logDoc) {
+    // If none exists, create one with an empty requests array.
+    logDoc = await Log.create({ originalUrl, requests: [] });
+  }
+
+  // Check if this request is already recorded.
+  const existingRequest = logDoc.requests.find(
+    (req) => req.requestId === requestId
+  );
+  if (!existingRequest) {
+    // If not, add a new request entry.
+    logDoc.requests.push({ requestId, source, processingConfig, events: [] });
+    await logDoc.save();
+  }
+
+  // Return a curried function that appends events to this request entry.
+  return async function logEventCurried({
+    status,
+    message,
+    error,
+  }: LogEventCurriedProps): Promise<void> {
+    try {
+      const event = {
+        status,
+        message,
+        createdAt: new Date(),
+        error: error || null,
+      };
+
+      // Push the new event to the specific request's events array.
+      await Log.updateOne(
+        { originalUrl, "requests.requestId": requestId },
+        { $push: { "requests.$.events": event } }
+      );
+
+      let coloredMessage;
+      if (status === "pending") {
+        coloredMessage = chalk.yellow.bold(message);
+      } else if (status === "processing") {
+        coloredMessage = chalk.blue.bold(message);
+      } else if (status === "completed") {
+        coloredMessage = chalk.green.bold(message);
+      } else {
+        coloredMessage = chalk.red.bold(message);
+      }
+
+      logger.info(
+        `📜 Log saved | ${coloredMessage} | RequestID: ${chalk.magenta(
+          requestId
+        )} | Source: ${chalk.cyan(source)} | OriginalURL: ${chalk.gray(
+          originalUrl
+        )} | Status: ${chalk.white.bold(status)}`
+      );
+    } catch (err) {
+      logger.error(
+        `❌ Failed to update log | RequestID: ${chalk.magenta(requestId)}`,
+        {
+          error: (err as Error).message,
+          stack: (err as Error).stack,
+        }
+      );
+    }
+  };
+}
+
+
+src/utils/doFetcher.ts
+----------------------
+import fetch from "node-fetch";
+
+export async function downloadFile(signedUrl: string): Promise<Buffer> {
+  const response = await fetch(signedUrl);
+  if (!response.ok) throw new Error("Failed to download file from signed URL");
+  return Buffer.from(await response.arrayBuffer());
+}
+
+export async function uploadFile(
+  signedUrl: string,
+  body: Buffer,
+  contentType: string
+): Promise<void> {
+  const response = await fetch(signedUrl, {
+    method: "PUT",
+    headers: { "Content-Type": contentType },
+    body,
+  });
+  if (!response.ok) throw new Error("Failed to upload file to signed URL");
+}
+
+
+src/utils/logger.ts
+-------------------
+// asset-server/src/utils/logger.ts
+import winston from "winston";
+
+// Custom Log Format
+const logFormat = winston.format.combine(
+  winston.format.timestamp(),
+  winston.format.colorize(),
+  winston.format.printf(({ timestamp, level, message, stack }) => {
+    return stack
+      ? `${timestamp} ${level}: ${message}\nStack: ${stack}`
+      : `${timestamp} ${level}: ${message}`;
+  })
+);
+
+export const logger = winston.createLogger({
+  level: "info",
+  format: logFormat,
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: "logs/worker.log", level: "info" }),
+    new winston.transports.File({ filename: "logs/error.log", level: "error" }),
+  ],
+});
+
+
+src/utils/imageProcessor.ts
+---------------------------
+import sharp from "sharp";
+import path from "path";
+import { promises as fs } from "fs";
+import type { LogEventCurriedProps } from "./logService";
+
+interface CropParams {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export async function processImage({
+  inputPath,
+  compress,
+  cropParams,
+  options,
+}: {
+  inputPath: string;
+  compress?: boolean;
+  cropParams?: CropParams;
+  options?: {
+    logEventFn?: (props: LogEventCurriedProps) => Promise<void>;
+  };
+}): Promise<string> {
+  // Hard-coded output folder for processed images
+  const outputFolder = path.join(process.cwd(), "processed");
+  await fs.mkdir(outputFolder, { recursive: true });
+
+  const baseName = path.basename(inputPath, path.extname(inputPath));
+  const outputPath = path.join(outputFolder, `processed-${baseName}.webp`);
+
+  // Initialize Sharp with the input file.
+  let image = sharp(inputPath);
+
+  // Validate cropping parameters if provided.
+  if (cropParams) {
+    const metadata = await image.metadata();
+    const imgWidth = metadata.width || 0;
+    const imgHeight = metadata.height || 0;
+
+    // Check if the crop rectangle exceeds the actual dimensions.
+    if (
+      cropParams.x < 0 ||
+      cropParams.y < 0 ||
+      cropParams.x + cropParams.width > imgWidth ||
+      cropParams.y + cropParams.height > imgHeight
+    ) {
+      console.error(
+        `Crop parameters (${cropParams.x}, ${cropParams.y}, ${cropParams.width}, ${cropParams.height}) exceed image dimensions (${imgWidth} x ${imgHeight}). ` +
+          `Proceeding without cropping (using full image).`
+      );
+      if (options?.logEventFn) {
+        await options?.logEventFn({
+          status: "warning",
+          message:
+            `Crop parameters (${cropParams.x}, ${cropParams.y}, ${cropParams.width}, ${cropParams.height}) exceed image dimensions (${imgWidth} x ${imgHeight}). ` +
+            `Proceeding without cropping (using full image).`,
+        });
+      }
+      // Set cropParams to full image dimensions (i.e., no cropping)
+      cropParams = { x: 0, y: 0, width: imgWidth, height: imgHeight };
+    }
+
+    // Apply the (validated or overridden) cropping.
+    image = image.extract({
+      left: cropParams.x,
+      top: cropParams.y,
+      width: cropParams.width,
+      height: cropParams.height,
+    });
+  }
+
+  // Determine quality based on compression flag and file size.
+  const stats = await fs.stat(inputPath);
+  const MIN_SIZE = 500 * 1024; // 500KB threshold
+  const quality = compress && stats.size > MIN_SIZE ? 60 : 100;
+
+  // Convert the image to WebP format with the determined quality.
+  await image.webp({ quality }).toFile(outputPath);
+
+  return outputPath;
+}
+
+
+src/models/Log.ts
+-----------------
+import mongoose, { Schema, Document } from "mongoose";
+
+export interface IRequestLog {
+  requestId: string;
+  source: string;
+  processingConfig?: object;
+  events: {
+    status: string;
+    message: string;
+    createdAt: Date;
+    error?: string; // new field to store error stack/message
+  }[];
+}
+
+export interface ILog extends Document {
+  originalUrl: string;
+  requests: IRequestLog[];
+}
+
+const EventSchema = new Schema(
+  {
+    status: {
+      type: String,
+      enum: [
+        "pending",
+        "processing",
+        "completed",
+        "failed",
+        "error",
+        "warning",
+      ],
+      required: true,
+    },
+    message: { type: String, required: true },
+    createdAt: { type: Date, default: Date.now },
+    error: { type: String, default: null }, // optional error field
+  },
+  { _id: true }
+);
+
+const RequestSchema = new Schema(
+  {
+    requestId: { type: String, required: true },
+    source: { type: String, required: true },
+    processingConfig: { type: Object },
+    events: [EventSchema],
+  },
+  { _id: false }
+);
+
+const LogSchema = new Schema<ILog>({
+  originalUrl: { type: String, required: true, unique: true },
+  requests: [RequestSchema],
+});
+
+export const Log = mongoose.model<ILog>("Log", LogSchema);
+
+
+src/index.ts
+------------
+// asset-server/src/index.ts (Combined Server + Worker)
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import morgan from "morgan";
+import assetRoutes from "./routes/assetRoutes";
+import { logger } from "./utils/logger";
+import connectDB from "./config/db";
+import { connectRabbitMQ, PROCESSING_QUEUE } from "./config/queue";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { downloadFile, uploadFile as doUploadFile } from "./utils/doFetcher";
+import { processImage } from "./utils/imageProcessor";
+import { processVideo } from "./utils/videoProcessor";
+import { processPDF } from "./utils/pdfProcessor";
+import { createLogger } from "./utils/logService";
+import { publicAssetExists } from "./utils/public-asset-exists";
+import { getAssetType } from "./utils/getAssetType";
+
+// --- Worker Functions ---
+
+async function processAsset(
+  assetType: string,
+  inputPath: string,
+  assetConfig: any,
+  options?: { logEventFn?: (props: any) => Promise<void> }
+): Promise<string> {
+  if (assetType === "image" && assetConfig.hasOwnProperty("imageProps")) {
+    const imageProps = assetConfig.imageProps;
+    return await processImage({
+      inputPath,
+      compress: imageProps?.compress,
+      cropParams: imageProps?.cropParams,
+      options: { logEventFn: options?.logEventFn },
+    });
+  } else if (
+    assetType === "video" &&
+    assetConfig.hasOwnProperty("videoProps")
+  ) {
+    const videoProps = assetConfig.videoProps;
+    return await processVideo({
+      inputPath,
+      cropParams: videoProps?.cropParams,
+      trimParams: videoProps?.trimParams,
+      compression: videoProps?.compression,
+      options: { logEventFn: options?.logEventFn },
+    });
+  } else if (assetType === "pdf" && assetConfig.hasOwnProperty("pdfProps")) {
+    const pdfProps = assetConfig.pdfProps;
+    const buffer = await processPDF({
+      inputPath,
+      compress: pdfProps?.compress,
+      options: { logEventFn: options?.logEventFn },
+    });
+    const tempDir = path.join(os.tmpdir(), "asset-worker");
+    const outPath = path.join(tempDir, `processed-pdf-${Date.now()}.pdf`);
+    await fs.promises.writeFile(outPath, buffer);
+    return outPath;
+  } else {
+    throw new Error("Unsupported asset type: " + assetType);
+  }
+}
+
+function getContentType(assetType: string): string {
+  switch (assetType) {
+    case "image":
+      return "image/jpeg";
+    case "video":
+      return "video/mp4";
+    case "pdf":
+      return "application/pdf";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+async function processMessage(msgContent: Buffer): Promise<void> {
+  let msg: any;
+  try {
+    msg = JSON.parse(msgContent.toString());
+    if (!msg.source || !msg.originalUrl || !msg.requestId) {
+      throw new Error(
+        "Missing required fields: source, originalUrl, or requestId"
+      );
+    }
+  } catch (error: any) {
+    logger.error("Message parsing failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return;
+  }
+
+  const { requestId, source, originalUrl, overwriteUrl, assetConfig } = msg;
+  const assetType = await getAssetType(originalUrl);
+  if (assetType === "unknown") {
+    logger.error(`Could not determine asset type for URL: ${originalUrl}`);
+    return;
+  }
+
+  // Create a log entry for this asset processing job.
+  const logEvent = await createLogger({
+    requestId,
+    source,
+    originalUrl,
+    processingConfig: assetConfig,
+  });
+
+  await logEvent({
+    status: "pending",
+    message: "Processing started",
+  });
+
+  const tempDir = path.join(os.tmpdir(), "asset-worker");
+  fs.mkdirSync(tempDir, { recursive: true });
+  const inputPath = path.join(tempDir, `input-${Date.now()}`);
+
+  // Step 1: Download the asset.
+  try {
+    const fileBuffer = await downloadFile(originalUrl);
+    fs.writeFileSync(inputPath, fileBuffer);
+    await logEvent({ status: "processing", message: "File downloaded" });
+    logger.info(`File downloaded to ${inputPath} | Request ID: ${requestId}`);
+  } catch (error: any) {
+    await logEvent({
+      status: "failed",
+      message: `Download failed: ${error.message}`,
+    });
+    throw error;
+  }
+
+  // Step 2: Process the asset.
+  let processedPath: string;
+  try {
+    processedPath = await processAsset(assetType, inputPath, assetConfig, {
+      logEventFn: logEvent,
+    });
+    await logEvent({
+      status: "processing",
+      message: "Processing complete, uploading to DO Spaces",
+    });
+    logger.info(`Processing complete | Request ID: ${requestId}`);
+  } catch (error: any) {
+    await logEvent({
+      status: "failed",
+      message: `Processing failed: ${error.message}`,
+    });
+    throw error;
+  }
+
+  // Step 3: Read processed file into a Buffer.
+  let processedBuffer: Buffer;
+  try {
+    processedBuffer = await fs.promises.readFile(processedPath);
+  } catch (error: any) {
+    logger.error("Failed to read processed file", {
+      error: error.message,
+      stack: error.stack,
+    });
+    throw error;
+  }
+
+  // Step 4: Check if original asset still exists, then upload the processed file.
+  try {
+    if (!(await publicAssetExists(originalUrl))) {
+      await logEvent({
+        status: "completed",
+        message: "Original asset deleted by user. Skipping final upload.",
+      });
+      logger.info(`Skipping upload; asset deleted at ${originalUrl}`);
+      return;
+    }
+    const contentType = getContentType(assetType);
+    await doUploadFile(overwriteUrl, processedBuffer, contentType);
+    await logEvent({ status: "completed", message: "Upload successful" });
+    logger.info(`Uploaded file to ${overwriteUrl} | Request ID: ${requestId}`);
+  } catch (error: any) {
+    await logEvent({
+      status: "failed",
+      message: `Upload failed: ${error.message}`,
+    });
+    throw error;
+  }
+
+  // Step 5: Cleanup temporary files.
+  try {
+    if (fs.existsSync(inputPath)) {
+      fs.unlinkSync(inputPath);
+      logger.info(`Deleted temp input file | Request ID: ${requestId}`);
+    } else {
+      logger.warn(
+        `Temp input file not found for cleanup | Request ID: ${requestId}`
+      );
+    }
+    if (fs.existsSync(processedPath)) {
+      fs.unlinkSync(processedPath);
+      logger.info(`Deleted processed file | Request ID: ${requestId}`);
+    } else {
+      logger.warn(
+        `Processed file not found for cleanup | Request ID: ${requestId}`
+      );
+    }
+  } catch (error: any) {
+    logger.error(`Error during cleanup | Request ID: ${requestId}`, {
+      error: error.message,
+      stack: error.stack,
+    });
+  }
+}
+
+async function startWorker(): Promise<void> {
+  const channel = await connectRabbitMQ();
+  channel.consume(PROCESSING_QUEUE, async (msg) => {
+    if (msg) {
+      try {
+        await processMessage(msg.content);
+        channel.ack(msg);
+        logger.info(
+          `Job acknowledged | Request ID: ${
+            JSON.parse(msg.content.toString()).requestId
+          }`
+        );
+      } catch (error: any) {
+        logger.error(
+          `Error processing message | Request ID: ${
+            JSON.parse(msg.content.toString()).requestId
+          }`,
+          { stack: error.stack }
+        );
+        channel.nack(msg, false, false);
+      }
+    }
+  });
+  logger.info("Worker is waiting for messages...");
+}
+
+async function startServerAndWorker() {
+  await connectDB();
+
+  const app = express();
+  app.use(express.json());
+  app.use(cors());
+  app.use(
+    morgan("combined", {
+      stream: { write: (message) => logger.info(message.trim()) },
+    })
+  );
+
+  app.use("/api/v1/assets", assetRoutes);
+  app.get("/", (_req, res) => res.send("Asset Server Running"));
+
+  const port = process.env.ASSET_SERVER_PORT || 4000;
+  app.listen(port, () => {
+    logger.info(`Asset Server listening on port ${port}`);
+  });
+
+  // Start the worker in the same process
+  startWorker().catch((err) => {
+    logger.error(`Worker failed to start: ${err.message}`, {
+      stack: err.stack,
+    });
+    process.exit(1);
+  });
+}
+
+startServerAndWorker().catch((err) => {
+  logger.error("Failed to start server and worker", {
+    message: err.message,
+    stack: err.stack,
+  });
+  process.exit(1);
+});
+
+// Global error handling for uncaught exceptions and unhandled rejections.
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught Exception:", {
+    message: error.message,
+    stack: error.stack,
+  });
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  logger.error("Unhandled Rejection:", { reason });
+});
+
+
+src/controllers/assetController.ts
+----------------------------------
+import { type Request, type Response } from "express";
+import { connectRabbitMQ, PROCESSING_QUEUE } from "../config/queue";
+import { logger } from "../utils/logger";
+import { v4 as uuidv4 } from "uuid";
+import { type AssetManagerRequestBody } from "@saranshkhulbe/types-asset-server";
+
+export async function createAssetJob(req: Request, res: Response) {
+  try {
+    const { source, originalUrl, overwriteUrl, ...extraOptions } =
+      req.body as AssetManagerRequestBody;
+
+    if (!source || !originalUrl || !overwriteUrl) {
+      logger.error("❌ Missing required fields");
+      console.log({ source, originalUrl, overwriteUrl });
+      return res.status(400).json({
+        error: "source, originalUrl, and overwriteUrl are required.",
+      });
+    }
+
+    const requestId = uuidv4();
+
+    const config = {
+      requestId,
+      source,
+      originalUrl,
+      overwriteUrl,
+      ...extraOptions,
+    };
+
+    const channel = await connectRabbitMQ();
+    channel.sendToQueue(PROCESSING_QUEUE, Buffer.from(JSON.stringify(config)), {
+      persistent: true,
+    });
+
+    logger.info(
+      `📤 Asset job published to RabbitMQ | Request ID: ${requestId}`
+    );
+    return res.json({ status: "queued", requestId });
+  } catch (err) {
+    logger.error("❌ Error in createAssetJob:", {
+      error: (err as Error).message,
+      stack: (err as Error).stack,
+    });
+    return res.status(500).json({ error: "Failed to create asset job" });
+  }
+}
+
+
+src/routes/assetRoutes.ts
+-------------------------
+import { Router } from "express";
+import { createAssetJob } from "../controllers/assetController";
+
+const router = Router();
+
+router.post("/", createAssetJob);
+
+export default router;
+
+
+src/worker.ts
+-------------
+// asset-server/src/worker.ts
+import { connectRabbitMQ, PROCESSING_QUEUE } from "./config/queue";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { downloadFile, uploadFile } from "./utils/doFetcher";
+import { processImage } from "./utils/imageProcessor";
+import { processVideo } from "./utils/videoProcessor";
+import { processPDF } from "./utils/pdfProcessor";
+import { createLogger, type LogEventCurriedProps } from "./utils/logService";
+import { logger } from "./utils/logger";
+import connectDB from "./config/db";
+import { publicAssetExists } from "./utils/public-asset-exists";
+import { getAssetType } from "./utils/getAssetType";
+import type { AssetManagerRequestBody } from "@saranshkhulbe/types-asset-server";
+
+// Connect to the database.
+await connectDB();
+
+function getContentType(assetType: string): string {
+  switch (assetType) {
+    case "image":
+      return "image/jpeg";
+    case "video":
+      return "video/mp4";
+    case "pdf":
+      return "application/pdf";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+async function processAsset(
+  assetType: string,
+  inputPath: string,
+  assetConfig: AssetManagerRequestBody["assetConfig"],
+  options?: {
+    logEventFn?: (props: LogEventCurriedProps) => Promise<void>;
+  }
+): Promise<string> {
+  if (assetType === "image" && assetConfig.hasOwnProperty("imageProps")) {
+    const imageProps = assetConfig?.imageProps;
+    return await processImage({
+      inputPath,
+      compress: imageProps?.compress,
+      cropParams: imageProps?.cropParams,
+      options: {
+        logEventFn: options?.logEventFn,
+      },
+    });
+  } else if (
+    assetType === "video" &&
+    assetConfig.hasOwnProperty("videoProps")
+  ) {
+    const videoProps = assetConfig?.videoProps;
+    return await processVideo({
+      inputPath,
+      cropParams: videoProps?.cropParams,
+      trimParams: videoProps?.trimParams,
+      compression: videoProps?.compression,
+      options: {
+        logEventFn: options?.logEventFn,
+      },
+    });
+  } else if (assetType === "pdf" && assetConfig.hasOwnProperty("pdfProps")) {
+    const pdfProps = assetConfig?.pdfProps;
+    const buffer = await processPDF({
+      inputPath,
+      compress: pdfProps?.compress,
+      options: {
+        logEventFn: options?.logEventFn,
+      },
+    });
+    const tempDir = path.join(os.tmpdir(), "asset-worker");
+    const outPath = path.join(tempDir, `processed-pdf-${Date.now()}.pdf`);
+    await fs.promises.writeFile(outPath, buffer);
+    return outPath;
+  } else {
+    throw new Error("Unsupported asset type: " + assetType);
+  }
+}
+
+async function processMessage(msgContent: Buffer): Promise<void> {
+  let msg: AssetManagerRequestBody & { requestId: string };
+
+  try {
+    msg = JSON.parse(msgContent.toString());
+    if (!msg.source || !msg.originalUrl || !msg.requestId) {
+      throw new Error(
+        "Missing required fields: source, originalUrl, or requestId"
+      );
+    }
+  } catch (error) {
+    logger.error("❌ Message parsing failed", {
+      error: (error as Error).message,
+      stack: (error as Error).stack,
+    });
+    return;
+  }
+  const { requestId, source, originalUrl, overwriteUrl, assetConfig } = msg;
+  const assetType = await getAssetType(originalUrl);
+  if (assetType === "unknown") {
+    logger.error(`❌ Could not determine asset type for URL: ${originalUrl}`);
+    return;
+  }
+
+  // Create a log entry (or update existing) for this asset using its originalUrl.
+  // The new request entry will include requestId, source, and processingConfig.
+  const logEvent = await createLogger({
+    requestId,
+    source,
+    originalUrl,
+    processingConfig: assetConfig,
+  });
+
+  await logEvent({
+    status: "pending",
+    message: "Processing started",
+  });
+
+  const tempDir = path.join(os.tmpdir(), "asset-worker");
+  fs.mkdirSync(tempDir, { recursive: true });
+  const inputPath = path.join(tempDir, `input-${Date.now()}`);
+
+  // Step 1: Download the asset.
+  try {
+    const fileBuffer = await downloadFile(originalUrl);
+    fs.writeFileSync(inputPath, fileBuffer);
+    await logEvent({
+      status: "processing",
+      message: "File downloaded",
+    });
+    logger.info(
+      `✅ File downloaded to ${inputPath} | Request ID: ${requestId}`
+    );
+  } catch (error) {
+    await logEvent({
+      status: "failed",
+      message: `Download failed: ${(error as Error).message}`,
+    });
+    throw error;
+  }
+
+  // Step 2: Process the asset.
+  let processedPath: string;
+  try {
+    processedPath = await processAsset(assetType, inputPath, assetConfig, {
+      logEventFn: logEvent,
+    });
+    await logEvent({
+      status: "processing",
+      message: "Processing complete, uploading to DO Spaces",
+    });
+    logger.info(`✅ Processing complete | Request ID: ${requestId}`);
+  } catch (error) {
+    await logEvent({
+      status: "failed",
+      message: `Processing failed: ${(error as Error).message}`,
+    });
+    throw error;
+  }
+
+  // Step 3: Read processed file into a Buffer.
+  let processedBuffer: Buffer;
+  try {
+    processedBuffer = await fs.promises.readFile(processedPath);
+  } catch (error) {
+    logger.error("❌ Failed to read processed file", {
+      error: (error as Error).message,
+      stack: (error as Error).stack,
+    });
+    throw error;
+  }
+
+  // Step 4: Before uploading, check if the original asset still exists publicly.
+  try {
+    if (!(await publicAssetExists(originalUrl))) {
+      await logEvent({
+        status: "completed",
+        message: "Original asset deleted by user. Skipping final upload.",
+      });
+      logger.info(`Skipping upload; asset deleted at ${originalUrl}`);
+      return;
+    }
+    const contentType = getContentType(assetType);
+    await uploadFile(overwriteUrl, processedBuffer, contentType);
+    await logEvent({
+      status: "completed",
+      message: "Upload successful",
+    });
+    logger.info(
+      `✅ Uploaded file to ${overwriteUrl} | Request ID: ${requestId}`
+    );
+  } catch (error) {
+    await logEvent({
+      status: "failed",
+      message: `Upload failed: ${(error as Error).message}`,
+    });
+    throw error;
+  }
+
+  // Step 5: Cleanup temporary files.
+  try {
+    if (fs.existsSync(inputPath)) {
+      fs.unlinkSync(inputPath);
+      logger.info(`🗑️ Deleted temp input file | Request ID: ${requestId}`);
+    } else {
+      logger.warn(
+        `Temp input file not found for cleanup | Request ID: ${requestId}`
+      );
+    }
+
+    if (fs.existsSync(processedPath)) {
+      fs.unlinkSync(processedPath);
+      logger.info(`🗑️ Deleted processed file | Request ID: ${requestId}`);
+    } else {
+      logger.warn(
+        `Processed file not found for cleanup | Request ID: ${requestId}`
+      );
+    }
+  } catch (error) {
+    logger.error(`❌ Error during cleanup | Request ID: ${requestId}`, {
+      error: (error as Error).message,
+      stack: (error as Error).stack,
+    });
+  }
+}
+
+async function startWorker(): Promise<void> {
+  const channel = await connectRabbitMQ();
+  channel.consume(PROCESSING_QUEUE, async (msg) => {
+    if (msg) {
+      try {
+        await processMessage(msg.content);
+        channel.ack(msg);
+        logger.info(
+          `✅ Job acknowledged | Request ID: ${
+            JSON.parse(msg.content.toString()).requestId
+          }`
+        );
+      } catch (error) {
+        logger.error(
+          `❌ Error processing message | Request ID: ${
+            JSON.parse(msg.content.toString()).requestId
+          }`,
+          { stack: (error as Error).stack }
+        );
+        channel.nack(msg, false, false);
+      }
+    }
+  });
+  logger.info("🐳 Worker is waiting for messages...");
+}
+
+process.on("uncaughtException", (error) => {
+  logger.error("💥 Uncaught Exception:", {
+    message: (error as Error).message,
+    stack: (error as Error).stack,
+  });
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  logger.error("⚠️ Unhandled Rejection:", { reason });
+});
+
+startWorker().catch((err) => {
+  logger.error(`🚨 Worker failed to start: ${(err as Error).message}`, {
+    stack: (err as Error).stack,
+  });
+  process.exit(1);
+});
