@@ -17,8 +17,8 @@ RUN apt-get update && \
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-# Expose your server port (4000) and RabbitMQ management port (15672)
-EXPOSE 4000 15672
+# Expose your server port (8000) and RabbitMQ management port (15672)
+EXPOSE 8000 15672
 
 # Start both RabbitMQ and your server using the entrypoint script
 CMD ["/app/entrypoint.sh"]

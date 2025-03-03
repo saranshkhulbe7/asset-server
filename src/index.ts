@@ -250,7 +250,7 @@ async function startServerAndWorker() {
   app.use("/api/v1/assets", assetRoutes);
   app.get("/", (_req, res) => res.send("Asset Server Running"));
 
-  const port = process.env.ASSET_SERVER_PORT || 4000;
+  const port = process.env.ASSET_SERVER_PORT || 8000;
   app.listen(port, () => {
     logger.info(`Asset Server listening on port ${port}`);
   });
